@@ -21,6 +21,90 @@ index 01654d22..4d5f1f10 100644
  	TgID       int64  `json:"tgId" form:"tgId"`             // Telegram user ID for notifications
  	SubID      string `json:"subId" form:"subId"`           // Subscription identifier
  	Comment    string `json:"comment" form:"comment"`       // Client comment
+diff --git a/web/assets/js/model/inbound.js b/web/assets/js/model/inbound.js
+index 1dd4411f..bf4e97a1 100644
+--- a/web/assets/js/model/inbound.js
++++ b/web/assets/js/model/inbound.js
+@@ -2088,6 +2088,8 @@ Inbound.ClientBase = class extends XrayCommonClass {
+         reset = 0,
+         created_at = undefined,
+         updated_at = undefined,
++        speedLimit = 0,
++        speedPriority = 5,
+     ) {
+         super();
+         this.email = email;
+@@ -2101,6 +2103,8 @@ Inbound.ClientBase = class extends XrayCommonClass {
+         this.reset = reset;
+         this.created_at = created_at;
+         this.updated_at = updated_at;
++        this.speedLimit = speedLimit;
++        this.speedPriority = speedPriority;
+     }
+ 
+     static commonArgsFromJson(json = {}) {
+@@ -2116,6 +2120,8 @@ Inbound.ClientBase = class extends XrayCommonClass {
+             json.reset,
+             json.created_at,
+             json.updated_at,
++            json.speedLimit ?? 0,
++            json.speedPriority ?? 5,
+         ];
+     }
+ 
+@@ -2132,6 +2138,8 @@ Inbound.ClientBase = class extends XrayCommonClass {
+             reset: this.reset,
+             created_at: this.created_at,
+             updated_at: this.updated_at,
++            speedLimit: this.speedLimit,
++            speedPriority: this.speedPriority,
+         };
+     }
+ 
+@@ -2160,6 +2168,15 @@ Inbound.ClientBase = class extends XrayCommonClass {
+     set _totalGB(gb) {
+         this.totalGB = NumberFormatter.toFixed(gb * SizeFormatter.ONE_GB, 0);
+     }
++
++    get _speedLimitMB() {
++        if (!this.speedLimit) return 0;
++        return NumberFormatter.toFixed(this.speedLimit / SizeFormatter.ONE_MB, 2);
++    }
++
++    set _speedLimitMB(mb) {
++        this.speedLimit = NumberFormatter.toFixed(mb * SizeFormatter.ONE_MB, 0);
++    }
+ };
+ 
+ Inbound.VmessSettings = class extends Inbound.Settings {
+diff --git a/web/assets/js/model/setting.js b/web/assets/js/model/setting.js
+index d61d4b8e..5b2f36c1 100644
+--- a/web/assets/js/model/setting.js
++++ b/web/assets/js/model/setting.js
+@@ -80,12 +80,23 @@ class AllSetting {
+         this.ldapDefaultExpiryDays = 0;
+         this.ldapDefaultLimitIP = 0;
+ 
++        this.bandwidthServerCapacity = 0;
++
+         if (data == null) {
+             return
+         }
+         ObjectUtil.cloneProps(this, data);
+     }
+ 
++    get _bandwidthCapacityMbps() {
++        if (!this.bandwidthServerCapacity) return 0;
++        return NumberFormatter.toFixed(this.bandwidthServerCapacity / SizeFormatter.ONE_MB * 8, 0);
++    }
++
++    set _bandwidthCapacityMbps(mbps) {
++        this.bandwidthServerCapacity = NumberFormatter.toFixed(mbps * SizeFormatter.ONE_MB / 8, 0);
++    }
++
+     equals(other) {
+         return ObjectUtil.equals(this, other);
+     }
 diff --git a/web/entity/entity.go b/web/entity/entity.go
 index 7f37f564..6552934b 100644
 --- a/web/entity/entity.go
@@ -35,6 +119,97 @@ index 7f37f564..6552934b 100644
  }
  
  // CheckValid validates all settings in the AllSetting struct, checking IP addresses, ports, SSL certificates, and other configuration values.
+diff --git a/web/html/component/aClientTable.html b/web/html/component/aClientTable.html
+index 0e32d45c..acd09ab9 100644
+--- a/web/html/component/aClientTable.html
++++ b/web/html/component/aClientTable.html
+@@ -271,4 +271,12 @@
+     -
+   </template>
+ </template>
++<template slot="speedLimit" slot-scope="text, client">
++  <a-tooltip v-if="client.speedLimit > 0" :title="'{{ i18n &quot;pages.inbounds.speedPriority&quot; }}: ' + (client.speedPriority || 5)">
++    <a-tag color="blue">[[ SizeFormatter.sizeFormat(client.speedLimit) ]]/s</a-tag>
++  </a-tooltip>
++  <a-tooltip v-else :title="'{{ i18n &quot;pages.inbounds.speedPriority&quot; }}: ' + (client.speedPriority || 5)">
++    <span>&#8734;</span>
++  </a-tooltip>
++</template>
+ {{end}}
+diff --git a/web/html/form/client.html b/web/html/form/client.html
+index 9c6a7f8a..d24ddc1a 100644
+--- a/web/html/form/client.html
++++ b/web/html/form/client.html
+@@ -193,6 +193,31 @@
+     </template>
+     <a-input-number v-model.number="client._totalGB" :min="0"></a-input-number>
+   </a-form-item>
++  <a-form-item>
++    <template slot="label">
++      <a-tooltip>
++        <template slot="title">
++          <span>{{ i18n "pages.inbounds.speedLimitDesc" }}</span>
++        </template>
++        {{ i18n "pages.inbounds.speedLimit" }}
++        <a-icon type="question-circle"></a-icon>
++      </a-tooltip>
++    </template>
++    <a-input-number v-model.number="client._speedLimitMB" :min="0" :style="{ width: '120px' }"></a-input-number>
++    <span style="margin-left:8px">MB/s</span>
++  </a-form-item>
++  <a-form-item>
++    <template slot="label">
++      <a-tooltip>
++        <template slot="title">
++          <span>{{ i18n "pages.inbounds.speedPriorityDesc" }}</span>
++        </template>
++        {{ i18n "pages.inbounds.speedPriority" }}
++        <a-icon type="question-circle"></a-icon>
++      </a-tooltip>
++    </template>
++    <a-slider v-model.number="client.speedPriority" :min="1" :max="10" :marks="{ 1: '1', 5: '5', 10: '10' }" :style="{ width: '200px' }"></a-slider>
++  </a-form-item>
+   <a-form-item v-if="isEdit && clientStats" label='{{ i18n "usage" }}'>
+     <a-tag :color="ColorUtils.clientUsageColor(clientStats, app.trafficDiff)">
+       [[ SizeFormatter.sizeFormat(clientStats.up) ]] / [[
+diff --git a/web/html/inbounds.html b/web/html/inbounds.html
+index 60de0750..8c33581b 100644
+--- a/web/html/inbounds.html
++++ b/web/html/inbounds.html
+@@ -862,6 +862,7 @@
+     { title: '{{ i18n "pages.inbounds.traffic" }}', width: 80, align: 'center', scopedSlots: { customRender: 'traffic' } },
+     { title: '{{ i18n "pages.inbounds.allTimeTraffic" }}', width: 60, align: 'center', scopedSlots: { customRender: 'allTime' } },
+     { title: '{{ i18n "pages.inbounds.expireDate" }}', width: 80, align: 'center', scopedSlots: { customRender: 'expiryTime' } },
++    { title: '{{ i18n "pages.inbounds.speedLimit" }}', width: 60, align: 'center', scopedSlots: { customRender: 'speedLimit' } },
+   ];
+ 
+   const innerMobileColumns = [
+diff --git a/web/html/settings/panel/general.html b/web/html/settings/panel/general.html
+index 6969a1b4..4aa3fc22 100644
+--- a/web/html/settings/panel/general.html
++++ b/web/html/settings/panel/general.html
+@@ -276,5 +276,20 @@
+             </template>
+         </a-setting-list-item>
+     </a-collapse-panel>
++    <a-collapse-panel key="bandwidth" :header="'{{ i18n &quot;pages.settings.bandwidthSettings&quot; }}'">
++        <a-setting-list-item paddings="small">
++            <template #title>
++                <a-tooltip>
++                    <template slot="title">{{ i18n "pages.settings.bandwidthCapacityDesc" }}</template>
++                    {{ i18n "pages.settings.bandwidthCapacity" }}
++                    <a-icon type="question-circle"></a-icon>
++                </a-tooltip>
++            </template>
++            <template #control>
++                <a-input-number :min="0" v-model="allSetting._bandwidthCapacityMbps" :style="{ width: '120px' }"></a-input-number>
++                <span style="margin-left:8px">Mbps</span>
++            </template>
++        </a-setting-list-item>
++    </a-collapse-panel>
+ </a-collapse>
+ {{end}}
+\ No newline at end of file
 diff --git a/web/service/setting.go b/web/service/setting.go
 index 560dce3a..78402712 100644
 --- a/web/service/setting.go
@@ -145,3 +320,28 @@ index ab440ac2..6dda83b4 100644
  // GetXrayTraffic fetches the current traffic statistics from the running Xray process.
  func (s *XrayService) GetXrayTraffic() ([]*xray.Traffic, []*xray.ClientTraffic, error) {
  	if !s.IsXrayRunning() {
+diff --git a/web/translation/translate.en_US.toml b/web/translation/translate.en_US.toml
+index 91580a29..9d25d001 100644
+--- a/web/translation/translate.en_US.toml
++++ b/web/translation/translate.en_US.toml
+@@ -246,6 +246,10 @@
+ "monitorDesc" = "Leave blank to listen on all IPs"
+ "meansNoLimit" = "= Unlimited. (unit: GB)"
+ "totalFlow" = "Total Flow"
++"speedLimit" = "Speed Limit"
++"speedLimitDesc" = "Max speed per direction (upload and download independently). 0 = unlimited, governed by priority."
++"speedPriority" = "Priority"
++"speedPriorityDesc" = "Fair-share weight 1–10. When multiple users compete for bandwidth, higher priority users are squeezed last."
+ "leaveBlankToNeverExpire" = "Leave blank to never expire"
+ "noRecommendKeepDefault" = "It is recommended to keep the default"
+ "certificatePath" = "File Path"
+@@ -412,6 +416,9 @@
+ "tgNotifyCpuDesc" = "Get notified if CPU load exceeds this threshold. (unit: %)"
+ "timeZone" = "Time Zone"
+ "timeZoneDesc" = "Scheduled tasks will run based on this time zone."
++"bandwidthSettings" = "Bandwidth"
++"bandwidthCapacity" = "Server Uplink Capacity"
++"bandwidthCapacityDesc" = "Total server uplink in Mbps. Used for dynamic per-user allocation. 0 = disable dynamic allocation (hard limits only)."
+ "subSettings" = "Subscription"
+ "subEnable" = "Subscription Service"
+ "subEnableDesc" = "Enable/Disable the subscription service."
