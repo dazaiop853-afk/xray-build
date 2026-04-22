@@ -95,10 +95,10 @@ index 00000000..2d49370b
 +}
 diff --git a/app/bandwidth/manager.go b/app/bandwidth/manager.go
 new file mode 100644
-index 00000000..eedfd839
+index 00000000..5cb56b14
 --- /dev/null
 +++ b/app/bandwidth/manager.go
-@@ -0,0 +1,205 @@
+@@ -0,0 +1,198 @@
 +// Package bandwidth implements per-user rate limiting for Xray-core.
 +// Configuration is read from a JSON file (default: /usr/local/x-ui/bandwidth.json)
 +// written by the 3x-ui panel. The file is re-read on every rebalance tick (5s),
@@ -112,11 +112,18 @@ index 00000000..eedfd839
 +	"time"
 +
 +	"github.com/xtls/xray-core/common/buf"
-+	"github.com/xtls/xray-core/features"
 +)
 +
-+// ManagerType is the type identifier used by core.OptionalFeatures.
-+func ManagerType() interface{} { return (*Manager)(nil) }
++const DefaultConfigPath = "/usr/local/x-ui/bandwidth.json"
++
++// Default is the singleton manager started at package init time.
++// It is always non-nil; if bandwidth.json is absent all rates are 0 (unlimited).
++var Default = NewManager(DefaultConfigPath)
++
++func init() {
++	// package-level var initializer already called NewManager; nothing more needed.
++	// This init exists to ensure the package is linked when imported by dispatcher.
++}
 +
 +// Config is the schema of bandwidth.json.
 +type Config struct {
@@ -162,20 +169,6 @@ index 00000000..eedfd839
 +	go m.rebalanceLoop()
 +	return m
 +}
-+
-+// Type implements features.Feature.
-+func (*Manager) Type() interface{} { return ManagerType() }
-+
-+// Start implements common.Runnable.
-+func (*Manager) Start() error { return nil }
-+
-+// Close implements common.Closable.
-+func (m *Manager) Close() error {
-+	close(m.done)
-+	return nil
-+}
-+
-+var _ features.Feature = (*Manager)(nil)
 +
 +// WrapWriters returns rate-limited writers for uplink and downlink for the given user.
 +func (m *Manager) WrapWriters(email string, upWriter, downWriter buf.Writer) (buf.Writer, buf.Writer) {
@@ -306,10 +299,10 @@ index 00000000..eedfd839
 +}
 diff --git a/app/bandwidth/manager_test.go b/app/bandwidth/manager_test.go
 new file mode 100644
-index 00000000..e835010f
+index 00000000..f006d12d
 --- /dev/null
 +++ b/app/bandwidth/manager_test.go
-@@ -0,0 +1,49 @@
+@@ -0,0 +1,48 @@
 +package bandwidth
 +
 +import (
@@ -349,7 +342,6 @@ index 00000000..e835010f
 +	defer os.Remove(f.Name())
 +
 +	m := NewManager(f.Name())
-+	defer m.Close()
 +
 +	m.mu.Lock()
 +	p := m.policyFor("alice@x.com")
@@ -360,7 +352,7 @@ index 00000000..e835010f
 +	}
 +}
 diff --git a/app/dispatcher/default.go b/app/dispatcher/default.go
-index f6cfd76e..d47ccc59 100644
+index f6cfd76e..cbb87154 100644
 --- a/app/dispatcher/default.go
 +++ b/app/dispatcher/default.go
 @@ -6,6 +6,7 @@ import (
@@ -371,34 +363,14 @@ index f6cfd76e..d47ccc59 100644
  	"github.com/xtls/xray-core/common"
  	"github.com/xtls/xray-core/common/buf"
  	"github.com/xtls/xray-core/common/errors"
-@@ -98,6 +99,7 @@ type DefaultDispatcher struct {
- 	policy policy.Manager
- 	stats  stats.Manager
- 	fdns   dns.FakeDNSEngine
-+	bw     *bandwidth.Manager
- }
- 
- func init() {
-@@ -107,6 +109,9 @@ func init() {
- 			core.OptionalFeatures(ctx, func(fdns dns.FakeDNSEngine) {
- 				d.fdns = fdns
- 			})
-+			core.OptionalFeatures(ctx, func(bwm *bandwidth.Manager) {
-+				d.bw = bwm
-+			})
- 			return d.Init(config.(*Config), om, router, pm, sm)
- 		}); err != nil {
- 			return nil, err
-@@ -182,6 +187,12 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
+@@ -182,6 +183,10 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
  		if p.Stats.UserOnline {
  			trackOnlineIP(ctx, d.stats, user.Email, sessionInbound.Source.Address.String())
  		}
 +
-+		if d.bw != nil {
-+			inboundLink.Writer, outboundLink.Writer = d.bw.WrapWriters(
-+				user.Email, inboundLink.Writer, outboundLink.Writer,
-+			)
-+		}
++		inboundLink.Writer, outboundLink.Writer = bandwidth.Default.WrapWriters(
++			user.Email, inboundLink.Writer, outboundLink.Writer,
++		)
  	}
  
  	return inboundLink, outboundLink
