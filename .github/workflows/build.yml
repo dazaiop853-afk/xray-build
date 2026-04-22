@@ -1,0 +1,99 @@
+name: Build Custom Xray
+
+on:
+  schedule:
+    - cron: '0 3 * * 1'   # every Monday 03:00 UTC
+  workflow_dispatch:        # manual trigger
+
+env:
+  XRAY_TAG: v26.4.17
+  UI_TAG: v2.9.2
+  GO_VERSION: '1.24'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout build-infra
+        uses: actions/checkout@v4
+
+      # ── Xray-core ──────────────────────────────────────────────────────────
+      - name: Clone xray-core ${{ env.XRAY_TAG }}
+        run: |
+          git clone --depth 1 --branch $XRAY_TAG \
+            https://github.com/XTLS/Xray-core xray-core
+
+      - name: Apply xray-core bandwidth patch
+        id: patch_xray
+        run: |
+          cd xray-core
+          git apply --check ../patches/xray-core-bandwidth.patch 2>&1
+          git apply ../patches/xray-core-bandwidth.patch
+
+      - name: Build xray binaries
+        if: steps.patch_xray.outcome == 'success'
+        run: |
+          cd xray-core
+          go version
+          mkdir -p ../dist
+          GOOS=linux GOARCH=amd64 go build -trimpath -o ../dist/xray-linux-amd64 ./main
+          GOOS=linux GOARCH=arm64 go build -trimpath -o ../dist/xray-linux-arm64 ./main
+        env:
+          CGO_ENABLED: '0'
+
+      # ── 3x-ui ──────────────────────────────────────────────────────────────
+      - name: Clone 3x-ui ${{ env.UI_TAG }}
+        run: |
+          git clone --depth 1 --branch $UI_TAG \
+            https://github.com/MHSanaei/3x-ui 3x-ui
+
+      - name: Apply 3x-ui bandwidth patch
+        id: patch_ui
+        run: |
+          cd 3x-ui
+          git apply --check ../patches/3x-ui-bandwidth.patch 2>&1
+          git apply ../patches/3x-ui-bandwidth.patch
+
+      - name: Build 3x-ui binary
+        if: steps.patch_ui.outcome == 'success'
+        run: |
+          cd 3x-ui
+          go build -trimpath -o ../dist/x-ui main.go
+        env:
+          CGO_ENABLED: '1'
+
+      # ── Release ────────────────────────────────────────────────────────────
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: custom-${{ env.XRAY_TAG }}-${{ env.UI_TAG }}-${{ github.run_number }}
+          name: "Custom Build | xray ${{ env.XRAY_TAG }} + 3x-ui ${{ env.UI_TAG }}"
+          body: |
+            **Xray-core**: ${{ env.XRAY_TAG }} + bandwidth throttling patch
+            **3x-ui**: ${{ env.UI_TAG }} + SpeedLimit/SpeedPriority fields
+
+            Both patches applied cleanly. Build ${{ github.run_number }}.
+          files: dist/*
+          fail_on_unmatched_files: true
+
+      # ── Notify on patch failure ────────────────────────────────────────────
+      - name: Open issue on patch failure
+        if: failure() && (steps.patch_xray.outcome == 'failure' || steps.patch_ui.outcome == 'failure')
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const xray = '${{ steps.patch_xray.outcome }}';
+            const ui   = '${{ steps.patch_ui.outcome }}';
+            const failed = [];
+            if (xray === 'failure') failed.push(`xray-core patch failed against **${{ env.XRAY_TAG }}**`);
+            if (ui   === 'failure') failed.push(`3x-ui patch failed against **${{ env.UI_TAG }}**`);
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              title: `[patch-failure] Build #${{ github.run_number }} — manual update required`,
+              body:  failed.join('\n') + '\n\nUpstream changed too much. Update the patch file(s) manually.',
+              labels: ['patch-failure'],
+            });

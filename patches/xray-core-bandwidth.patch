@@ -1,0 +1,404 @@
+diff --git a/app/bandwidth/bucket.go b/app/bandwidth/bucket.go
+new file mode 100644
+index 00000000..2d49370b
+--- /dev/null
++++ b/app/bandwidth/bucket.go
+@@ -0,0 +1,89 @@
++package bandwidth
++
++import (
++	"sync"
++	"time"
++
++	"github.com/xtls/xray-core/common/buf"
++)
++
++// atomicTime is a mutex-protected time.Time used as a struct field.
++type atomicTime struct {
++	mu sync.Mutex
++	t  time.Time
++}
++
++func (a *atomicTime) set(t time.Time) {
++	a.mu.Lock()
++	a.t = t
++	a.mu.Unlock()
++}
++
++func (a *atomicTime) get() time.Time {
++	a.mu.Lock()
++	defer a.mu.Unlock()
++	return a.t
++}
++
++// tokenBucket is a thread-safe token bucket. rate=0 means unlimited.
++type tokenBucket struct {
++	mu       sync.Mutex
++	rate     int64 // bytes/sec
++	tokens   int64
++	lastFill time.Time
++}
++
++func newTokenBucket(rate int64) *tokenBucket {
++	return &tokenBucket{rate: rate, lastFill: time.Now()}
++}
++
++func (b *tokenBucket) setRate(rate int64) {
++	b.mu.Lock()
++	b.rate = rate
++	b.mu.Unlock()
++}
++
++// consume blocks until n bytes are cleared by the token bucket.
++func (b *tokenBucket) consume(n int64) {
++	b.mu.Lock()
++	defer b.mu.Unlock()
++
++	if b.rate <= 0 {
++		return
++	}
++
++	now := time.Now()
++	elapsed := now.Sub(b.lastFill)
++	b.lastFill = now
++
++	earned := int64(elapsed.Seconds() * float64(b.rate))
++	b.tokens += earned
++	if b.tokens > b.rate { // cap burst to 1 second
++		b.tokens = b.rate
++	}
++
++	b.tokens -= n
++	if b.tokens >= 0 {
++		return
++	}
++
++	debt := -b.tokens
++	wait := time.Duration(float64(debt) / float64(b.rate) * float64(time.Second))
++	b.mu.Unlock()
++	time.Sleep(wait)
++	b.mu.Lock()
++	b.tokens = 0
++}
++
++// limitedWriter wraps a buf.Writer with a token bucket.
++type limitedWriter struct {
++	w      buf.Writer
++	bucket *tokenBucket
++	seen   *atomicTime
++}
++
++func (w *limitedWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
++	w.seen.set(time.Now())
++	w.bucket.consume(int64(mb.Len()))
++	return w.w.WriteMultiBuffer(mb)
++}
+diff --git a/app/bandwidth/manager.go b/app/bandwidth/manager.go
+new file mode 100644
+index 00000000..eedfd839
+--- /dev/null
++++ b/app/bandwidth/manager.go
+@@ -0,0 +1,205 @@
++// Package bandwidth implements per-user rate limiting for Xray-core.
++// Configuration is read from a JSON file (default: /usr/local/x-ui/bandwidth.json)
++// written by the 3x-ui panel. The file is re-read on every rebalance tick (5s),
++// so changes take effect without restarting Xray.
++package bandwidth
++
++import (
++	"encoding/json"
++	"os"
++	"sync"
++	"time"
++
++	"github.com/xtls/xray-core/common/buf"
++	"github.com/xtls/xray-core/features"
++)
++
++// ManagerType is the type identifier used by core.OptionalFeatures.
++func ManagerType() interface{} { return (*Manager)(nil) }
++
++// Config is the schema of bandwidth.json.
++type Config struct {
++	// ServerCapacity is the total server uplink in bytes/sec.
++	// 0 disables dynamic reallocation; hard limits still apply.
++	ServerCapacity int64 `json:"serverCapacity"`
++	// Users maps email → per-user policy.
++	Users map[string]UserPolicy `json:"users"`
++}
++
++// UserPolicy holds the bandwidth parameters for one user.
++type UserPolicy struct {
++	// Limit is the hard ceiling in bytes/sec. 0 = no ceiling.
++	Limit int64 `json:"limit"`
++	// Priority is the fair-share weight 1–10. Default 5.
++	Priority int `json:"priority"`
++}
++
++// Manager tracks per-user token buckets and rebalances rates dynamically.
++type Manager struct {
++	configPath string
++
++	mu             sync.Mutex
++	cfg            Config
++	buckets        map[string]*userBuckets
++	done           chan struct{}
++}
++
++type userBuckets struct {
++	up       *tokenBucket
++	down     *tokenBucket
++	lastSeen atomicTime
++}
++
++// NewManager creates a Manager that reads config from configPath.
++func NewManager(configPath string) *Manager {
++	m := &Manager{
++		configPath: configPath,
++		buckets:    make(map[string]*userBuckets),
++		done:       make(chan struct{}),
++	}
++	m.loadConfig() // best-effort at startup
++	go m.rebalanceLoop()
++	return m
++}
++
++// Type implements features.Feature.
++func (*Manager) Type() interface{} { return ManagerType() }
++
++// Start implements common.Runnable.
++func (*Manager) Start() error { return nil }
++
++// Close implements common.Closable.
++func (m *Manager) Close() error {
++	close(m.done)
++	return nil
++}
++
++var _ features.Feature = (*Manager)(nil)
++
++// WrapWriters returns rate-limited writers for uplink and downlink for the given user.
++func (m *Manager) WrapWriters(email string, upWriter, downWriter buf.Writer) (buf.Writer, buf.Writer) {
++	m.mu.Lock()
++	ub, ok := m.buckets[email]
++	if !ok {
++		policy := m.policyFor(email)
++		rate := m.initialRate(policy)
++		ub = &userBuckets{
++			up:   newTokenBucket(rate),
++			down: newTokenBucket(rate),
++		}
++		m.buckets[email] = ub
++	}
++	m.mu.Unlock()
++
++	ub.lastSeen.set(time.Now())
++	return &limitedWriter{w: upWriter, bucket: ub.up, seen: &ub.lastSeen},
++		&limitedWriter{w: downWriter, bucket: ub.down, seen: &ub.lastSeen}
++}
++
++func (m *Manager) policyFor(email string) UserPolicy {
++	if p, ok := m.cfg.Users[email]; ok {
++		if p.Priority < 1 {
++			p.Priority = 5
++		}
++		return p
++	}
++	return UserPolicy{Priority: 5}
++}
++
++func (m *Manager) initialRate(p UserPolicy) int64 {
++	if p.Limit > 0 {
++		return p.Limit
++	}
++	if m.cfg.ServerCapacity > 0 {
++		return m.cfg.ServerCapacity
++	}
++	return 0 // unlimited until first rebalance
++}
++
++func (m *Manager) loadConfig() {
++	data, err := os.ReadFile(m.configPath)
++	if err != nil {
++		return
++	}
++	var cfg Config
++	if json.Unmarshal(data, &cfg) == nil {
++		m.mu.Lock()
++		m.cfg = cfg
++		m.mu.Unlock()
++	}
++}
++
++func (m *Manager) rebalanceLoop() {
++	ticker := time.NewTicker(5 * time.Second)
++	defer ticker.Stop()
++	for {
++		select {
++		case <-ticker.C:
++			m.loadConfig()
++			if m.cfg.ServerCapacity > 0 {
++				m.rebalance()
++			}
++		case <-m.done:
++			return
++		}
++	}
++}
++
++func (m *Manager) rebalance() {
++	cutoff := time.Now().Add(-10 * time.Second)
++
++	m.mu.Lock()
++	defer m.mu.Unlock()
++
++	type slot struct {
++		email string
++		ub    *userBuckets
++		pol   UserPolicy
++	}
++	active := make([]slot, 0, len(m.buckets))
++	totalWeight := 0
++	for email, ub := range m.buckets {
++		if ub.lastSeen.get().After(cutoff) {
++			pol := m.policyFor(email)
++			active = append(active, slot{email, ub, pol})
++			totalWeight += pol.Priority
++		}
++	}
++	if totalWeight == 0 {
++		return
++	}
++
++	cap := m.cfg.ServerCapacity
++	remaining := cap
++	type alloc struct {
++		s     slot
++		rate  int64
++		fixed bool // hit hard limit
++	}
++	allocs := make([]alloc, len(active))
++	for i, s := range active {
++		share := int64(s.pol.Priority) * cap / int64(totalWeight)
++		if s.pol.Limit > 0 && share > s.pol.Limit {
++			allocs[i] = alloc{s, s.pol.Limit, true}
++			remaining -= s.pol.Limit
++		} else {
++			allocs[i] = alloc{s, share, false}
++		}
++	}
++
++	// redistribute headroom from capped users to uncapped users
++	uncappedWeight := 0
++	for i, a := range allocs {
++		if !a.fixed {
++			uncappedWeight += active[i].pol.Priority
++		}
++	}
++	for i := range allocs {
++		if !allocs[i].fixed && uncappedWeight > 0 {
++			allocs[i].rate = int64(active[i].pol.Priority) * remaining / int64(uncappedWeight)
++		}
++		r := allocs[i].rate
++		allocs[i].s.ub.up.setRate(r)
++		allocs[i].s.ub.down.setRate(r)
++	}
++}
+diff --git a/app/bandwidth/manager_test.go b/app/bandwidth/manager_test.go
+new file mode 100644
+index 00000000..e835010f
+--- /dev/null
++++ b/app/bandwidth/manager_test.go
+@@ -0,0 +1,49 @@
++package bandwidth
++
++import (
++	"os"
++	"testing"
++	"time"
++)
++
++func TestTokenBucketUnlimited(t *testing.T) {
++	b := newTokenBucket(0)
++	start := time.Now()
++	b.consume(10 * 1024 * 1024) // 10 MB — should be instant
++	if time.Since(start) > 50*time.Millisecond {
++		t.Fatal("unlimited bucket should not block")
++	}
++}
++
++func TestTokenBucketThrottles(t *testing.T) {
++	rate := int64(1024 * 1024) // 1 MB/s
++	b := newTokenBucket(rate)
++	b.tokens = 0 // drain initial tokens
++
++	start := time.Now()
++	b.consume(rate / 2) // consume 0.5s worth
++	elapsed := time.Since(start)
++	// should have waited ~0.5s
++	if elapsed < 400*time.Millisecond {
++		t.Fatalf("expected throttle ~500ms, got %v", elapsed)
++	}
++}
++
++func TestManagerLoadsConfig(t *testing.T) {
++	cfg := `{"serverCapacity":1000000,"users":{"alice@x.com":{"limit":500000,"priority":8}}}`
++	f, _ := os.CreateTemp("", "bw*.json")
++	f.WriteString(cfg)
++	f.Close()
++	defer os.Remove(f.Name())
++
++	m := NewManager(f.Name())
++	defer m.Close()
++
++	m.mu.Lock()
++	p := m.policyFor("alice@x.com")
++	m.mu.Unlock()
++
++	if p.Limit != 500000 || p.Priority != 8 {
++		t.Fatalf("unexpected policy: %+v", p)
++	}
++}
+diff --git a/app/dispatcher/default.go b/app/dispatcher/default.go
+index f6cfd76e..d47ccc59 100644
+--- a/app/dispatcher/default.go
++++ b/app/dispatcher/default.go
+@@ -6,6 +6,7 @@ import (
+ 	"sync"
+ 	"time"
+ 
++	"github.com/xtls/xray-core/app/bandwidth"
+ 	"github.com/xtls/xray-core/common"
+ 	"github.com/xtls/xray-core/common/buf"
+ 	"github.com/xtls/xray-core/common/errors"
+@@ -98,6 +99,7 @@ type DefaultDispatcher struct {
+ 	policy policy.Manager
+ 	stats  stats.Manager
+ 	fdns   dns.FakeDNSEngine
++	bw     *bandwidth.Manager
+ }
+ 
+ func init() {
+@@ -107,6 +109,9 @@ func init() {
+ 			core.OptionalFeatures(ctx, func(fdns dns.FakeDNSEngine) {
+ 				d.fdns = fdns
+ 			})
++			core.OptionalFeatures(ctx, func(bwm *bandwidth.Manager) {
++				d.bw = bwm
++			})
+ 			return d.Init(config.(*Config), om, router, pm, sm)
+ 		}); err != nil {
+ 			return nil, err
+@@ -182,6 +187,12 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
+ 		if p.Stats.UserOnline {
+ 			trackOnlineIP(ctx, d.stats, user.Email, sessionInbound.Source.Address.String())
+ 		}
++
++		if d.bw != nil {
++			inboundLink.Writer, outboundLink.Writer = d.bw.WrapWriters(
++				user.Email, inboundLink.Writer, outboundLink.Writer,
++			)
++		}
+ 	}
+ 
+ 	return inboundLink, outboundLink
